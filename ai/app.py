@@ -8,6 +8,106 @@ import numpy as np
 import cv2
 import threading, time
 import subprocess, time, threading
+import re
+from collections import Counter
+CROP_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
+
+def autocrop_region(video_path: str,
+                    probe_seconds: int = 8,
+                    limit: float = 0.18,      # ↑ more sensitive than 0.094
+                    round_val: int = 2):
+    """
+    Try ffmpeg cropdetect; if nothing is returned, fall back to OpenCV edge scan.
+    Returns (w, h, x, y) or None.
+    """
+    # -------- try ffmpeg cropdetect --------
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostdin",
+        "-ss", "0", "-t", str(probe_seconds),
+        "-i", video_path,
+        "-vf", f"cropdetect=limit={limit}:round={round_val}:reset=0",
+        "-f", "null", "-"
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True)
+        text = (out.stderr or "") + (out.stdout or "")
+        crops = CROP_RE.findall(text)
+        if crops:
+            w, h, x, y = map(int, Counter(crops).most_common(1)[0][0])
+            if w > 0 and h > 0:
+                print(f"[autocrop] ffmpeg cropdetect -> {w}x{h}+{x}+{y}")
+                return (w, h, x, y)
+    except Exception as e:
+        print(f"[autocrop] cropdetect error: {e}")
+
+    # -------- fallback: OpenCV edge scan --------
+    try:
+        import numpy as np, cv2
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("[autocrop] cv2 open failed")
+            return None
+
+        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+        # sample a few frames over the first probe_seconds
+        end_frame = min(frames - 1, int(fps * probe_seconds))
+        idxs = np.linspace(0, max(0, end_frame), 5, dtype=int)
+
+        # luma threshold (0..255). 22~28 works well for “almost black” bars.
+        thr = 24
+
+        x1 = 0; y1 = 0; x2 = W; y2 = H
+        any_frame = False
+
+        for i in idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            any_frame = True
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            col_mean = gray.mean(axis=0)
+            row_mean = gray.mean(axis=1)
+
+            # find first/last columns/rows that are above threshold
+            left = int(np.argmax(col_mean > thr))
+            right = int(W - np.argmax(col_mean[::-1] > thr))
+            top = int(np.argmax(row_mean > thr))
+            bottom = int(H - np.argmax(row_mean[::-1] > thr))
+
+            # intersect across samples (be conservative)
+            x1 = max(x1, left)
+            y1 = max(y1, top)
+            x2 = min(x2, right)
+            y2 = min(y2, bottom)
+
+        cap.release()
+
+        if not any_frame:
+            return None
+
+        # safety / rounding to even
+        x1 = max(0, min(x1, W - 2))
+        y1 = max(0, min(y1, H - 2))
+        x2 = max(x1 + 2, min(x2, W))
+        y2 = max(y1 + 2, min(y2, H))
+        w = ((x2 - x1) // 2) * 2
+        h = ((y2 - y1) // 2) * 2
+
+        if w > 0 and h > 0 and (w < W or h < H):
+            print(f"[autocrop] opencv edge -> {w}x{h}+{x1}+{y1} (from {W}x{H})")
+            return (w, h, x1, y1)
+
+    except Exception as e:
+        print(f"[autocrop] opencv error: {e}")
+
+    print("[autocrop] no crop detected")
+    return None
+
 
 def ffprobe_duration_seconds(path: str) -> float:
     """Return media duration in seconds using ffprobe, or 0.0 if unknown."""
@@ -24,51 +124,83 @@ def ffprobe_duration_seconds(path: str) -> float:
         return 0.0
 
 
+def _parse_hms_to_seconds(hms: str) -> float:
+    # "00:01:23.45" -> seconds
+    try:
+        hh, mm, ss = hms.split(":")
+        return int(hh) * 3600 + int(mm) * 60 + float(ss)
+    except Exception:
+        return 0.0
+
 def run_ffmpeg_with_progress(cmd, total_duration: float):
     """
-    Run ffmpeg with `-progress pipe:1` and print readable percent progress.
-    total_duration is seconds (used to compute %).
+    Run ffmpeg and print readable progress. Accepts both:
+      - out_time_ms=123456789
+      - out_time=HH:MM:SS.micro
+    Gracefully ignores N/A.
     """
+    # IMPORTANT: put progress flags BEFORE the output file in the command the caller gives us.
     start = time.time()
     last_print = 0.0
-    # ensure progress keys are emitted to stdout
-    cmd_with_progress = cmd[:] + ["-progress", "pipe:1", "-nostats"]
 
+    # Make sure progress flags are present; caller builds base cmd without them.
+    cmd_with_progress = cmd[:]  # expect -progress pipe:1 -nostats already included by caller
     print("[ffmpeg]", " ".join(cmd_with_progress))
+
     proc = subprocess.Popen(
         cmd_with_progress,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        bufsize=1
+        bufsize=1,
     )
+
     try:
-        for line in proc.stdout:
-            line = line.strip()
+        for raw in proc.stdout:
+            line = raw.strip()
             if not line:
                 continue
-            # ffmpeg progress keys look like: out_time_ms=123456789
+
+            t_sec = None
             if line.startswith("out_time_ms="):
-                t_ms = int(line.split("=", 1)[1])
-                t = t_ms / 1_000_000.0  # microseconds -> seconds
-                pct = 0 if total_duration <= 0 else min(99, int((t / total_duration) * 100))
-                # throttle prints to ~2/sec
+                val = line.split("=", 1)[1].strip()
+                # guard against N/A
+                if val.upper() != "N/A":
+                    try:
+                        t_sec = int(val) / 1_000_000.0
+                    except Exception:
+                        t_sec = None
+            elif line.startswith("out_time="):
+                # e.g. 00:00:12.34
+                t_sec = _parse_hms_to_seconds(line.split("=", 1)[1].strip())
+
+            # print throttled progress
+            if t_sec is not None:
+                pct = 0
+                if total_duration and total_duration > 0:
+                    pct = min(99, int((t_sec / total_duration) * 100))
                 now = time.time()
                 if now - last_print > 0.5:
-                    print(f"[progress] {t:6.1f}s ({pct:2d}%)")
+                    if total_duration > 0:
+                        print(f"[progress] {t_sec:6.1f}s ({pct:2d}%)")
+                    else:
+                        # duration unknown—show elapsed only
+                        print(f"[progress] {t_sec:6.1f}s")
                     last_print = now
-            elif line.startswith("progress="):
-                # progress=continue | end
-                if line.endswith("end"):
-                    print(f"[progress] done in {time.time()-start:0.1f}s")
-            else:
-                # keep other ffmpeg lines visible (bitrate, speed, etc.)
-                if "speed=" in line or "bitrate=" in line:
-                    print("[ffmpeg]", line)
+
+            # keep useful ffmpeg lines
+            if "speed=" in line or "bitrate=" in line:
+                print("[ffmpeg]", line)
+
+            if line.startswith("progress=") and line.endswith("end"):
+                elapsed = time.time() - start
+                print(f"[progress] done in {elapsed:0.1f}s")
+
     finally:
         ret = proc.wait()
         if ret != 0:
             raise RuntimeError(f"ffmpeg failed (code {ret})")
+
 
 def run_with_heartbeat(cmd):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -262,51 +394,74 @@ def detect_facecam_bbox(video_path, sample_every_sec=0.5, min_persistence=6):
 # -------- FFmpeg composition to 1080x1920 --------
 def render_tiktok_layout(src_path, out_path, face_bbox=None, fast=False, use_nvenc=False):
     CANVAS_W, CANVAS_H = 1080, 1920
-    game_crop = "crop=iw*0.6:ih*0.6:iw*0.2:ih*0.2"  # center 60%
+    game_crop_center = "crop=iw*0.6:ih*0.6:iw*0.2:ih*0.2"  # central 60% after any auto-crop
 
-    # Background: scale to "cover" using 'increase', then crop, then blur
+    # ---------- [AUTO-CROP] detect black bars and prep a [src] stream ----------
+    ac = autocrop_region(src_path)  # returns (w,h,x,y) or None
+    if ac:
+        aw, ah, ax, ay = ac
+        pre = f"[0:v]crop={aw}:{ah}:{ax}:{ay}[src];"
+        src = "[src]"
+        # If we detected a face box on the original frame, shift it into the cropped coords
+        if face_bbox:
+            x, y, w, h, W, H = face_bbox
+            # translate so (0,0) is at crop top-left
+            x, y = max(0, x - ax), max(0, y - ay)
+            # clamp within new bounds
+            x = min(x, max(0, aw - 1))
+            y = min(y, max(0, ah - 1))
+            w = min(w, aw - x)
+            h = min(h, ah - y)
+            face_bbox = (x, y, w, h, aw, ah)
+    else:
+        pre = ""
+        src = "[0:v]"
+
+    # --------- build filter graph using src (either cropped or original) -------
+    # Background: cover 1080x1920 then blur
     bg = (
-        f"[0:v]scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
+        f"{src}scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
         f"crop={CANVAS_W}:{CANVAS_H},boxblur=30[bg];"
     )
-    game = f"[0:v]{game_crop},scale={CANVAS_W}:{CANVAS_W}[game];"
 
-    filter_complex = bg + game
+    # Foreground gameplay (square area centered) after auto-crop
+    game = (
+        f"{src}{game_crop_center},scale={CANVAS_W}:{CANVAS_W}[game];"
+    )
+
+    filter_complex = pre + bg + game
     overlays = "[bg][game]overlay=(W-w)/2:(H-h)/2[tmp]"
 
+    # Face-cam overlay (optional)
     if face_bbox:
-        x, y, w, h, W, H = face_bbox
+        x, y, w, h, Wn, Hn = face_bbox  # Wn/Hn correspond to the src stream dimensions (possibly auto-cropped)
         face_w = 480
-        filter_complex += f"[0:v]crop={w}:{h}:{x}:{y},scale={face_w}:-1[face];"
-        overlays = overlays.replace("[tmp]", "[base]")
-        overlays += ";[base][face]overlay=(W-w)/2:80[tmp]"
+        filter_complex += f"{src}crop={w}:{h}:{x}:{y},scale={face_w}:-1[face];"
+        overlays = overlays.replace("[tmp]", "[base]") + ";[base][face]overlay=(W-w)/2:80[tmp]"
 
     filter_complex += overlays
 
     # speed/quality knobs
     preset = "ultrafast" if fast else "veryfast"
     crf = "24" if fast else "20"
-
-    # choose encoder
     if use_nvenc:
         vcodec = ["-c:v","h264_nvenc","-rc","vbr","-cq","23","-preset","p5","-pix_fmt","yuv420p"]
     else:
         vcodec = ["-c:v","libx264","-pix_fmt","yuv420p","-preset",preset,"-crf",crf]
 
     cmd = [
-         "ffmpeg","-y","-hide_banner",
-    "-i", src_path,
-    "-filter_complex", filter_complex,
-    "-map","[tmp]","-map","0:a?",
-    *vcodec,
-    "-c:a","aac","-b:a","128k",
-    "-movflags","+faststart",
-    "-progress","pipe:1","-nostats",   # <<< move here
-    out_path
+        "ffmpeg","-y","-hide_banner",
+        "-i", src_path,
+        "-filter_complex", filter_complex,
+        "-map","[tmp]","-map","0:a?",
+        *vcodec,
+        "-c:a","aac","-b:a","128k",
+        "-movflags","+faststart",
+        "-progress","pipe:1","-nostats",   # keep before output to see progress
+        out_path
     ]
 
-    # get total duration for % calc (ok to use input duration)
-    total = ffprobe_duration_seconds(src_path)
+    total = ffprobe_duration_seconds(src_path)  # may be 0.0; we handle that in the parser
     run_ffmpeg_with_progress(cmd, total_duration=total)
 
 
@@ -337,8 +492,12 @@ def tiktok():
 
     # temp paths
     suffix = os.path.splitext(file.filename)[1].lower()
-    tmp_in  = os.path.join(tempfile.gettempdir(), f"in_{uuid.uuid4().hex}{suffix}")
-    tmp_out = os.path.join(tempfile.gettempdir(), f"tiktok_{uuid.uuid4().hex}.mp4")
+    OUTPUT_FOLDER = r"D:\Videos"
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    tmp_in  = os.path.join(OUTPUT_FOLDER, f"in_{uuid.uuid4().hex}{suffix}")
+    tmp_out = os.path.join(OUTPUT_FOLDER, f"tiktok_{uuid.uuid4().hex}.mp4")
+
 
     try:
         print("[tiktok] upload received:", file.filename)
