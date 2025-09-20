@@ -1,0 +1,200 @@
+You are helping me build a **web-based SaaS video editing app** (gameplay highlight detection + editing).  
+The stack is structured as:
+
+- **Frontend (React/Next.js)**  
+  - Handles file uploads, timeline editing UI, showing previews, and final download links.  
+  - Talks to backend API(s).  
+
+- **Backend (Node.js/Express or Nest.js)**  
+  - Acts as the API gateway for the frontend.  
+  - Handles auth (JWT or sessions), user/project storage, billing integration, and passes video processing requests to the AI service.  
+  - Stores metadata + project state (JSON timelines, clips, user history).  
+  - Long-term: uses a job queue (BullMQ/Redis) for processing.  
+
+- **AI/Processing Service (Python, Flask or FastAPI)**  
+  - Handles actual video/audio analysis.  
+  - Uses **FFmpeg/MoviePy/PyAV** for media I/O.  
+  - Uses **AI/ML libraries** for highlight detection:  
+    - **PySceneDetect** for scene changes.  
+    - **Whisper** for speech-to-text.  
+    - **YOLO/OpenCV** for kill-feed / HUD detection.  
+    - **Librosa/Torchaudio** for audio energy, gunshots, hype detection.  
+  - Returns a JSON timeline/EDL with scored segments.  
+  - Later: add rendering/export service with FFmpeg + GPU acceleration.  
+
+- **Storage/CDN**  
+  - S3 or equivalent for uploaded files, proxies, and rendered exports.  
+  - CloudFront/Cloudflare for delivery.  
+  - Optional: Mux/Cloudflare Stream for managed VOD pipeline.  
+
+---
+
+## Project Folder Structure (current idea)
+You are helping me build a **web-based SaaS video editing app** (gameplay highlight detection + editing).  
+The stack is structured as:
+
+- **Frontend (React/Next.js)**  
+  - Handles file uploads, timeline editing UI, showing previews, and final download links.  
+  - Talks to backend API(s).  
+
+- **Backend (Node.js/Express or Nest.js)**  
+  - Acts as the API gateway for the frontend.  
+  - Handles auth (JWT or sessions), user/project storage, billing integration, and passes video processing requests to the AI service.  
+  - Stores metadata + project state (JSON timelines, clips, user history).  
+  - Long-term: uses a job queue (BullMQ/Redis) for processing.  
+
+- **AI/Processing Service (Python, Flask or FastAPI)**  
+  - Handles actual video/audio analysis.  
+  - Uses **FFmpeg/MoviePy/PyAV** for media I/O.  
+  - Uses **AI/ML libraries** for highlight detection:  
+    - **PySceneDetect** for scene changes.  
+    - **Whisper** for speech-to-text.  
+    - **YOLO/OpenCV** for kill-feed / HUD detection.  
+    - **Librosa/Torchaudio** for audio energy, gunshots, hype detection.  
+  - Returns a JSON timeline/EDL with scored segments.  
+  - Later: add rendering/export service with FFmpeg + GPU acceleration.  
+
+- **Storage/CDN**  
+  - S3 or equivalent for uploaded files, proxies, and rendered exports.  
+  - CloudFront/Cloudflare for delivery.  
+  - Optional: Mux/Cloudflare Stream for managed VOD pipeline.  
+
+---
+
+## Project Folder Structure (current idea)
+project-root/
+│── frontend/ # React or Next.js frontend
+│ └── package.json
+│
+│── backend/ # Node.js/Express backend
+│ └── server.js
+│ └── package.json
+│
+│── ai/ # Python AI/processing microservice
+│ └── app.py
+│ └── requirements.txt
+│
+│── venv/ # Python virtual environment
+│
+│── README.md # Project documentation
+
+---
+
+## Current `app.py` (Python AI service, simplified)
+- Starts a Flask app on port 5001.
+- Accepts `POST /process` with video file upload.
+- Saves video temporarily → loads with MoviePy → extracts metadata (duration, fps, resolution).
+- Returns metadata as JSON.
+- Cleans up temporary file.
+- TODO: add silence detection, scene cuts, highlight scoring.
+
+---
+
+## Next Steps in Development
+1. **Decide architecture**:  
+   - Option A: Frontend → Node.js backend → Python AI service (proxy chain).  
+   - Option B: Frontend → Python AI service directly (needs CORS).  
+
+2. **Harden `app.py`** (use temp files, filename sanitization, CORS).  
+
+3. **Implement analysis features** (progressive MVP):  
+   - Silence detection (via FFmpeg `silencedetect` or librosa).  
+   - Scene detection (PySceneDetect).  
+   - OCR/kill-feed detection (Tesseract, PaddleOCR, OpenCV).  
+   - Audio hype scoring (Whisper + energy levels).  
+   - Output timeline JSON (clip in/out times with scores).  
+
+4. **Rendering/export**  
+   - Use FFmpeg to stitch together clips from timeline JSON.  
+   - Exports to MP4/H.264 for YouTube/TikTok.  
+
+5. **Frontend**  
+   - Upload page → preview timeline clips → allow manual adjustment.  
+   - “Render” button → calls backend → exports file.  
+
+6. **Backend (Node.js)**  
+   - Manage users/projects.  
+   - Store timeline JSONs in DB (Postgres/Mongo).  
+   - Forward video files to AI service.  
+   - Queue background render jobs.  
+
+---
+
+## Instructions for You (the assistant in future chats)
+- Always **review existing code files** I paste in and explain what they do.  
+- Suggest **refactoring, fixes, and best practices** (security, scaling, clarity).  
+- Help me **incrementally add features** (silence detection, scene cuts, highlight scoring, rendering).  
+- Provide **ready-to-run code snippets** with proper error handling.  
+- Assume I want **production-quality SaaS**, but we’re building in small steps.  
+- Keep answers **clear, structured, and modular** so I can copy/paste into my code.  
+
+---
+
+## How I’ll Extend This Prompt
+As I add new files or features, I’ll paste them here under sections like:
+
+- `server.js (Node backend)`
+- `frontend/App.js`
+- `ai/highlight_detection.py`
+- `database schema`
+- etc.
+
+Update explanations and next steps accordingly.
+
+I’m building a web SaaS video editing backend in Python with Flask. 
+The goal is: 
+- Take gameplay videos (1920x1080 or 2K),
+- Convert them into TikTok format (1080x1920 vertical),
+- Add a blurred background fill,
+- Center the gameplay in the middle (square crop),
+- Detect a face-cam box if present and overlay it resized at the top,
+- Export the final TikTok-ready MP4 into an "exports" folder,
+- Show encoding progress (percent/elapsed time) in the Flask server console while FFmpeg runs.
+
+I already use:
+- Flask (with optional flask_cors),
+- MoviePy (for metadata),
+- OpenCV (for face-cam detection with Haar cascades),
+- FFmpeg (for final rendering).
+
+I need working code that includes:
+1. A Flask app with routes:
+   - `/` → health check,
+   - `/process` → test endpoint that just inspects the uploaded video and returns metadata (duration, fps, resolution, has_audio),
+   - `/tiktok` → takes uploaded video and produces TikTok output as described, saving to `<project-root>/exports/`.
+   - `/download/<filename>` → serve finished exports.
+
+2. Helpers:
+   - `_allowed()` to validate file types,
+   - `detect_facecam_bbox()` using OpenCV to find persistent faces in video corners,
+   - `ffprobe_duration_seconds()` to get video length,
+   - `run_ffmpeg_with_progress()` to parse `-progress pipe:1` output and print `[progress] 12.3s (37%)` style logs in Flask console,
+   - `render_tiktok_layout()` that builds the FFmpeg filter_complex:
+       * blurred 1080x1920 background,
+       * centered square gameplay crop (scaled to 1080x1080),
+       * optional facecam overlay scaled to ~480px wide at the top,
+       * encoded with libx264 or h264_nvenc depending on flags,
+       * `fast_mode` (ultrafast, CRF 24) vs normal (veryfast, CRF 20).
+
+3. Behavior:
+   - Upload temp files to system temp,
+   - Keep final outputs in `<project-root>/exports/`,
+   - Return JSON with correct Windows path (both backslash and forward slash forms),
+   - Print encoding progress in Flask console (so I can see it’s not hung).
+
+4. Usage example:
+   ```powershell
+   curl.exe -F "video=@D:\Websites\Gamedit.ai\Gamedit.ai\backend\uploads\gameplay.mp4" ^
+     http://127.0.0.1:5001/tiktok
+
+Make sure:
+
+Progress shows percent done in the Flask console,
+
+The JSON response includes the final absolute path, filename, and download URL,
+
+No reliance on async workers (just sync processing is fine for now),
+
+Compatible with Windows 10/11 + PowerShell.
+
+Please generate a complete ai/app.py file with this functionality.
