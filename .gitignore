@@ -94,5 +94,13 @@ yarn-error.log*
 # Ignore prompt file
 prompt.txt
 
-# Ignore uploaded videos
+# Ignore uploaded/large video files
+*.mp4
+*.mov
+*.mkv
+backend/uploads/
+
+*.mp4
+*.mov
+*.mkv
 backend/uploads/
